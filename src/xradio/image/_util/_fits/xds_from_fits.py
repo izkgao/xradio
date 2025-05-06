@@ -178,20 +178,8 @@ def _xds_direction_attrs_from_header(helpers: dict, header) -> dict:
     direction["lonpole"] = make_quantity(
         header["LONPOLE"] * _deg_to_rad, "rad", dims=["l", "m"]
     )
-    pc = np.zeros([2, 2])
-    for i in (0, 1):
-        for j in (0, 1):
-            # dir_axes are now 0-based, but fits needs 1-based
-            try:
-                pc[i][j] = header[f"PC{dir_axes[i]+1}_{dir_axes[j]+1}"]
-            except KeyError:
-                try:
-                    pc[i][j] = header[f"PC0{dir_axes[i]+1}_0{dir_axes[j]+1}"]
-                except KeyError:
-                    raise RuntimeError(
-                        f"Could not find PC{dir_axes[i]+1}_{dir_axes[j]+1} or "
-                        f"PC0{dir_axes[i]+1}_0{dir_axes[j]+1} in FITS header"
-                    )
+    wcs = WCS(header, fix=False)
+    pc = wcs.wcs.pc[:2, :2]
     direction["pc"] = pc
     # Is there really no fits header parameter for projection_parameters?
     direction["projection_parameters"] = np.array([0.0, 0.0])
