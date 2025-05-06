@@ -1,38 +1,36 @@
-import astropy as ap
-from astropy import units as u
-from astropy.io import fits
-from astropy.time import Time
-from ..common import (
-    _compute_linear_world_values,
-    _compute_velocity_values,
-    _compute_world_sph_dims,
-    _convert_beam_to_rad,
-    _default_freq_info,
-    _doppler_types,
-    _freq_from_vel,
-    _get_unit,
-    _get_xds_dim_order,
-    _image_type,
-    _l_m_attr_notes,
-)
-from xradio._utils.coord_math import _deg_to_rad
-from xradio._utils.dict_helpers import (
-    make_frequency_reference_dict,
-    make_quantity,
-    make_skycoord_dict,
-    make_time_measure_dict,
-)
 import copy
+import re
+from typing import Union
+
+import astropy as ap
 import dask
 import dask.array as da
 import numpy as np
-import re
-from typing import Union
 import xarray as xr
+from astropy import units as u
+from astropy.io import fits
+from astropy.time import Time
+from astropy.wcs import WCS
+
+from xradio._utils.coord_math import _deg_to_rad
+from xradio._utils.dict_helpers import (make_frequency_reference_dict,
+                                        make_quantity, make_skycoord_dict,
+                                        make_time_measure_dict)
+
+from ..common import (_compute_linear_world_values, _compute_velocity_values,
+                      _compute_world_sph_dims, _convert_beam_to_rad,
+                      _default_freq_info, _doppler_types, _freq_from_vel,
+                      _get_unit, _get_xds_dim_order, _image_type,
+                      _l_m_attr_notes)
 
 
 def _fits_image_to_xds(
-    img_full_path: str, chunks: dict, verbose: bool, do_sky_coords: bool
+    img_full_path: str,
+    chunks: dict,
+    verbose: bool,
+    do_sky_coords: bool,
+    fits_calc_mask: bool,
+    fits_hdu_index: int,
 ) -> dict:
     """
     TODO: complete documentation
@@ -42,13 +40,13 @@ def _fits_image_to_xds(
     # may also need to pass mode='denywrite'
     # https://stackoverflow.com/questions/35759713/astropy-io-fits-read-row-from-large-fits-file-with-mutliple-hdus
     hdulist = fits.open(img_full_path, memmap=True)
-    attrs, helpers, header = _fits_header_to_xds_attrs(hdulist)
+    attrs, helpers, header = _fits_header_to_xds_attrs(hdulist, fits_calc_mask)
     hdulist.close()
     # avoid keeping reference to mem-mapped fits file
     del hdulist
     xds = _create_coords(helpers, header, do_sky_coords)
     sphr_dims = helpers["sphr_dims"]
-    ary = _read_image_array(img_full_path, chunks, helpers, verbose)
+    ary = _read_image_array_v2(img_full_path, chunks, helpers, verbose, fits_hdu_index)
     dim_order = _get_xds_dim_order(sphr_dims)
     xds = _add_sky_or_aperture(xds, ary, dim_order, header, helpers, sphr_dims)
     xds.attrs = attrs
@@ -352,7 +350,9 @@ def _create_dim_map(helpers: dict, header) -> dict:
     return dim_map
 
 
-def _fits_header_to_xds_attrs(hdulist: fits.hdu.hdulist.HDUList) -> tuple:
+def _fits_header_to_xds_attrs(
+    hdulist: fits.hdu.hdulist.HDUList, fits_calc_mask: bool
+) -> tuple:
     primary = None
     beams = None
     for hdu in hdulist:
@@ -388,7 +388,10 @@ def _fits_header_to_xds_attrs(hdulist: fits.hdu.hdulist.HDUList) -> tuple:
     if dir_axes is not None:
         attrs["direction"] = _xds_direction_attrs_from_header(helpers, header)
     # FIXME read fits data in chunks in case all data too large to hold in memory
-    helpers["has_mask"] = da.any(da.isnan(primary.data)).compute()
+    if fits_calc_mask:
+        helpers["has_mask"] = da.any(da.isnan(primary.data)).compute()
+    else:
+        helpers["has_mask"] = False
     beam = _beam_attr_from_header(helpers, header)
     if beam != "mb":
         helpers["beam"] = beam
@@ -756,6 +759,136 @@ def _read_image_array(
     ary = da.concatenate(d0slices, axis=0)
     ary = da.expand_dims(ary, new_axes)
     return ary.transpose(transpose_list)
+
+
+@dask.delayed
+def mmap_load_chunk(filename, shape, dtype, offset, sl):
+    """
+    Memory map the given file with overall shape and dtype and return a slice
+    specified by :code:`sl`.
+
+    Parameters
+    ----------
+    filename : str
+    shape : tuple
+        Total shape of the data in the file
+    dtype:
+        NumPy dtype of the data in the file
+    offset : int
+        Skip :code:`offset` bytes from the beginning of the file.
+    sl:
+        Object that can be used for indexing or slicing a NumPy array to
+        extract a chunk
+
+    Returns
+    -------
+    numpy.memmap or numpy.ndarray
+        View into memory map created by indexing with :code:`sl`,
+        or NumPy ndarray in case no view can be created using :code:`sl`.
+    """
+    data = np.memmap(filename, mode="r", shape=shape, dtype=dtype, offset=offset)
+    return data[sl]
+
+
+def mmap_dask_array(filename, shape, dtype, offset=0, chunks="auto"):
+    """
+    Create a Dask array from raw binary data in :code:`filename`
+    by memory mapping.
+    This method creates a dask array with the same chunking pattern as
+    da.ones(shape, dtype=dtype), and works for arrays of any dimensionality.
+
+    Parameters
+    ----------
+    filename : str
+    shape : tuple
+        Total shape of the data in the file
+    dtype:
+        NumPy dtype of the data in the file
+    offset : int, optional
+        Skip :code:`offset` bytes from the beginning of the file.
+    chunks : int, tuple
+        How to chunk the array
+
+    Returns
+    -------
+    dask.array.Array
+        Dask array matching :code:`shape` and :code:`dtype`, backed by
+        memory-mapped chunks with the same chunking as
+        da.ones(shape, dtype=dtype).
+    """
+    # Create a sample array to get the default chunking
+    sample_array = da.empty(shape, dtype=dtype, chunks=chunks)
+    chunks = sample_array.chunks
+
+    # Special case for 0-dimensional arrays
+    if len(shape) == 0:
+        delayed_chunk = mmap_load_chunk(filename, shape, dtype, offset, ())
+        return da.from_delayed(delayed_chunk, shape=(), dtype=dtype)
+
+    # Calculate the chunk indices for each dimension
+    chunk_indices = []
+    for dim_chunks in chunks:
+        indices = []
+        start = 0
+        for size in dim_chunks:
+            indices.append((start, start + size))
+            start += size
+        chunk_indices.append(indices)
+
+    # Function to build a block at specific chunk indices
+    def build_block(idx_tuple):
+        # Create slices from the chunk indices
+        slices = tuple(slice(start, stop) for start, stop in idx_tuple)
+
+        # Calculate the shape of this chunk
+        chunk_shape = tuple(stop - start for start, stop in idx_tuple)
+
+        # Create a delayed chunk
+        delayed_chunk = mmap_load_chunk(filename, shape, dtype, offset, slices)
+
+        # Create a dask array from the delayed chunk
+        return da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=dtype)
+
+    # Create a nested list structure that matches the dimensionality of chunks
+    # This is a recursive function to handle any number of dimensions
+    def create_nested_blocks(dimension=0, indices=()):
+        if dimension == len(chunks):
+            # We've reached the right depth, build the block
+            return build_block(indices)
+        else:
+            # Create a list of blocks for this dimension
+            blocks_in_dim = []
+            for idx in chunk_indices[dimension]:
+                new_indices = indices + (idx,)
+                blocks_in_dim.append(create_nested_blocks(dimension + 1, new_indices))
+            return blocks_in_dim
+
+    # Create the nested structure of blocks
+    nested_blocks = create_nested_blocks()
+
+    # Combine all blocks using da.block
+    return da.block(nested_blocks)
+
+
+def _read_image_array_v2(
+    img_full_path: str, chunks: str | dict, helpers: dict, verbose: bool, hdu_index: int
+) -> da.array:
+    with fits.open(img_full_path, memmap=True) as hdul:
+        hdu = hdul[hdu_index]
+        dtype = np.dtype(hdu.data.dtype)
+        shape = hdu.data.shape
+        offset = hdu._data_offset
+        header = hdu.header
+
+    ary = mmap_dask_array(
+        filename=img_full_path,
+        shape=shape,
+        dtype=dtype,
+        offset=offset,
+        chunks=chunks,
+    )[:, :, None, :, :]
+
+    return ary
 
 
 def _get_chunk_list(chunks: dict, helpers: dict) -> tuple:

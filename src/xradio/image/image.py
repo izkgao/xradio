@@ -32,6 +32,8 @@ def read_image(
     verbose: bool = False,
     do_sky_coords: bool = True,
     selection: dict = {},
+    fits_calc_mask: bool = True,
+    fits_hdu_index: int = 0,
 ) -> xr.Dataset:
     """
     Convert CASA, FITS, or zarr image to xradio image xds format
@@ -69,6 +71,10 @@ def read_image(
         the selection, and the end pixel is not. An empty dictionary (the
         default) indicates that the entire image should be returned. Currently
         only supported for images stored in zarr format.
+    fits_calc_mask : bool
+        Calculate mask for NaN values from fits image. Default is True.
+    fits_hdu_index : int
+        The index of the HDU to read from the fits file. Default is 0.
 
     Returns
     -------
@@ -94,7 +100,9 @@ def read_image(
     # next statement is for debug, comment when done debugging
     # return _read_fits_image(infile, chunks, verbose, do_sky_coords)
     try:
-        return _read_fits_image(infile, chunks, verbose, do_sky_coords)
+        return _read_fits_image(
+            infile, chunks, verbose, do_sky_coords, fits_calc_mask, fits_hdu_index
+        )
     except Exception as e:
         emsgs.append(f"image format appears not to be fits {e.args}")
     # when done debuggin comment out next line
