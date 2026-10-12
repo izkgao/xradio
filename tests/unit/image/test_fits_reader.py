@@ -866,6 +866,40 @@ def test_pixels_in_native_byte_order_with_declared_dtype(tmp_path, dtype):
     assert "FLAG_SKY" not in xds
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        {},
+        {"frequency": 1, "polarization": 1},
+        {"frequency": 2, "polarization": 3, "l": 4, "m": 2},
+        {"frequency": 1, "polarization": 1, "l": 1, "m": 1},
+    ],
+)
+def test_pixels_read_in_any_chunks_from_one_graph_layer(tmp_path, chunks):
+    """Every block is read from its own location, whether the blocks divide
+    the axes or not, and the read is one graph layer however many blocks
+    there are, so a cube read in many small blocks builds and computes
+    quickly."""
+    path, data = write_fits(tmp_path / "chunks.fits")
+    xds = read(path, chunks=chunks, do_sky_coords=False, compute_mask=False)
+    sky = xds.SKY.data
+    want = {"frequency": NCHAN, "polarization": 4, "l": NX, "m": NY} | chunks
+    assert sky.chunksize == (
+        1,
+        want["frequency"],
+        want["polarization"],
+        want["l"],
+        want["m"],
+    )
+    # the read, then expand_dims and transpose to the image dimensions
+    layers = sky.__dask_graph__().layers
+    assert len([name for name in layers if name.startswith("_read_image")]) == 1
+    assert len(layers) <= 3
+    np.testing.assert_array_equal(
+        sky.compute(), expected_sky(data, (RA, DEC, FREQ, stokes_axis()))
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Telescope and observation date (R11)                                         #
 # --------------------------------------------------------------------------- #

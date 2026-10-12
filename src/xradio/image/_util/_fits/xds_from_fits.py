@@ -1534,9 +1534,32 @@ def _add_sky_or_aperture(
 def _read_image_array(
     img_full_path: str, chunks: dict, helpers: dict, verbose: bool
 ) -> da.array:
-    # memmap = True allows only part of data to be loaded into memory
-    # may also need to pass mode='denywrite'
-    # https://stackoverflow.com/questions/35759713/astropy-io-fits-read-row-from-large-fits-file-with-mutliple-hdus
+    """
+    Return the pixels of a FITS image as a lazily read dask array.
+
+    The array is one ``map_blocks`` layer: each block is read by
+    :func:`_read_image_chunk` from the block's own location. Building it costs
+    the same for any number of blocks, and its graph has one task per block,
+    so cubes read in many small blocks (one plane per block, for example)
+    build and compute quickly.
+
+    Parameters
+    ----------
+    img_full_path : str
+        Path to the FITS file.
+    chunks : dict
+        Dask chunk lengths by dimension, see :func:`_get_chunk_list`.
+    helpers : dict
+        Header information from :func:`_fits_header_to_xds_attrs`.
+    verbose : bool
+        Unused.
+
+    Returns
+    -------
+    dask.array.Array
+        The pixels with dimensions (time, frequency, polarization, l, m) (or
+        u, v), the axes the FITS file does not have added with length one.
+    """
     if isinstance(chunks, dict):
         mychunks = _get_chunk_list(chunks, helpers)
     else:
@@ -1545,48 +1568,29 @@ def _read_image_array(
         )
     transpose_list, new_axes = _get_transpose_list(helpers)
     data_type = helpers["dtype"]
-    rshape = helpers["shape"][::-1]
-    full_chunks = mychunks + tuple([1 for rr in range(5) if rr >= len(mychunks)])
-    d0slices = []
-    blc = tuple(5 * [0])
-    trc = tuple(rshape) + tuple([1 for rr in range(5) if rr >= len(mychunks)])
-    for d0 in range(blc[0], trc[0], full_chunks[0]):
-        d0len = min(full_chunks[0], trc[0] - d0)
-        d1slices = []
-        for d1 in range(blc[1], trc[1], full_chunks[1]):
-            d1len = min(full_chunks[1], trc[1] - d1)
-            d2slices = []
-            for d2 in range(blc[2], trc[2], full_chunks[2]):
-                d2len = min(full_chunks[2], trc[2] - d2)
-                d3slices = []
-                for d3 in range(blc[3], trc[3], full_chunks[3]):
-                    d3len = min(full_chunks[3], trc[3] - d3)
-                    d4slices = []
-                    for d4 in range(blc[4], trc[4], full_chunks[4]):
-                        d4len = min(full_chunks[4], trc[4] - d4)
-                        shapes = tuple(
-                            [d0len, d1len, d2len, d3len, d4len][: len(rshape)]
-                        )
-                        starts = tuple([d0, d1, d2, d3, d4][: len(rshape)])
-                        delayed_array = dask.delayed(_read_image_chunk)(
-                            img_full_path, shapes, starts, data_type
-                        )
-                        d4slices += [da.from_delayed(delayed_array, shapes, data_type)]
-                    d3slices += (
-                        [da.concatenate(d4slices, axis=4)]
-                        if len(rshape) > 4
-                        else d4slices
-                    )
-                d2slices += (
-                    [da.concatenate(d3slices, axis=3)] if len(rshape) > 3 else d3slices
-                )
-            d1slices += (
-                [da.concatenate(d2slices, axis=2)] if len(rshape) > 2 else d2slices
-            )
-        d0slices += [da.concatenate(d1slices, axis=1)] if len(rshape) > 1 else d1slices
-    ary = da.concatenate(d0slices, axis=0)
+    # FITS axes in numpy (reversed) order, as the file stores them
+    rshape = tuple(helpers["shape"][::-1])
+    block_chunks = da.core.normalize_chunks(mychunks, rshape)
+    ary = da.map_blocks(
+        _read_image_block,
+        img_full_path,
+        data_type,
+        chunks=block_chunks,
+        dtype=data_type,
+        meta=np.empty((0,) * len(rshape), dtype=data_type),
+    )
     ary = da.expand_dims(ary, new_axes)
     return ary.transpose(transpose_list)
+
+
+def _read_image_block(
+    img_full_path: str, dtype: str, block_info: dict | None = None
+) -> np.ndarray:
+    """Read the block of a ``map_blocks`` array that ``block_info`` locates."""
+    location = block_info[None]["array-location"]
+    shapes = tuple(stop - start for start, stop in location)
+    starts = tuple(start for start, _ in location)
+    return _read_image_chunk(img_full_path, shapes, starts, dtype)
 
 
 def _get_chunk_list(chunks: dict, helpers: dict) -> tuple:
