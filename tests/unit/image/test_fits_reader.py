@@ -863,6 +863,20 @@ def test_pixels_in_native_byte_order_with_declared_dtype(tmp_path, dtype):
     assert chunk.dtype == np.dtype(dtype) and chunk.dtype.isnative
     assert chunk.flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(chunk, data[1:3, 0:2, 1:4, 2:6])
+    # mapped from the pixels' offset, the block is the same native copy
+    with fits.open(path) as hdulist:
+        offset = hdulist.fileinfo(0)["datLoc"]
+    mapped = _read_image_chunk(
+        path,
+        (2, 2, 3, 4),
+        (1, 0, 1, 2),
+        np.dtype(dtype).name,
+        data_offset=offset,
+        shape=data.shape,
+    )
+    assert mapped.dtype == np.dtype(dtype) and mapped.dtype.isnative
+    assert mapped.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(mapped, chunk)
     assert "FLAG_SKY" not in xds
 
 
@@ -875,11 +889,11 @@ def test_pixels_in_native_byte_order_with_declared_dtype(tmp_path, dtype):
         {"frequency": 1, "polarization": 1, "l": 1, "m": 1},
     ],
 )
-def test_pixels_read_in_any_chunks_from_one_graph_layer(tmp_path, chunks):
+def test_pixels_read_in_any_chunks_from_one_graph_layer(tmp_path, monkeypatch, chunks):
     """Every block is read from its own location, whether the blocks divide
     the axes or not, and the read is one graph layer however many blocks
-    there are, so a cube read in many small blocks builds and computes
-    quickly."""
+    there are, mapping the pixels without opening the file as FITS again, so
+    a cube read in many small blocks builds and computes quickly."""
     path, data = write_fits(tmp_path / "chunks.fits")
     xds = read(path, chunks=chunks, do_sky_coords=False, compute_mask=False)
     sky = xds.SKY.data
@@ -895,9 +909,15 @@ def test_pixels_read_in_any_chunks_from_one_graph_layer(tmp_path, chunks):
     layers = sky.__dask_graph__().layers
     assert len([name for name in layers if name.startswith("_read_image")]) == 1
     assert len(layers) <= 3
+    opens = []
+    original = fits.open
+    monkeypatch.setattr(
+        fits, "open", lambda *a, **k: opens.append(a) or original(*a, **k)
+    )
     np.testing.assert_array_equal(
         sky.compute(), expected_sky(data, (RA, DEC, FREQ, stokes_axis()))
     )
+    assert opens == []
 
 
 # --------------------------------------------------------------------------- #

@@ -843,9 +843,10 @@ def _fits_header_to_xds_attrs(
             )
     primary = None
     ignored = []
-    for hdu in hdulist:
+    for index, hdu in enumerate(hdulist):
         if hdu.name == "PRIMARY":
             primary = hdu
+            primary_index = index
             # Memory map support check
             # avoid possibly non-existent hdu.scale_type attribute check and check header instead
             header = hdu.header
@@ -883,6 +884,10 @@ def _fits_header_to_xds_attrs(
         )
     helpers = {}
     attrs = {}
+    # where the pixels start in the file, so that the chunk reader can map them
+    # without opening the file as FITS and parsing its header again
+    fileinfo = hdulist.fileinfo(primary_index)
+    helpers["data_offset"] = None if fileinfo is None else fileinfo["datLoc"]
     naxes = header["NAXIS"]
     helpers["naxes"] = naxes
     dim_map = _create_dim_map(helpers, header)
@@ -1538,10 +1543,11 @@ def _read_image_array(
     Return the pixels of a FITS image as a lazily read dask array.
 
     The array is one ``map_blocks`` layer: each block is read by
-    :func:`_read_image_chunk` from the block's own location. Building it costs
-    the same for any number of blocks, and its graph has one task per block,
-    so cubes read in many small blocks (one plane per block, for example)
-    build and compute quickly.
+    :func:`_read_image_chunk` from the block's own location, mapping the
+    pixels from where the header ends rather than opening the file as FITS
+    again. Building it costs the same for any number of blocks, and its graph
+    has one task per block, so cubes read in many small blocks (one plane per
+    block, for example) build and compute quickly.
 
     Parameters
     ----------
@@ -1575,6 +1581,8 @@ def _read_image_array(
         _read_image_block,
         img_full_path,
         data_type,
+        helpers.get("data_offset"),
+        rshape,
         chunks=block_chunks,
         dtype=data_type,
         meta=np.empty((0,) * len(rshape), dtype=data_type),
@@ -1584,13 +1592,19 @@ def _read_image_array(
 
 
 def _read_image_block(
-    img_full_path: str, dtype: str, block_info: dict | None = None
+    img_full_path: str,
+    dtype: str,
+    data_offset: int | None,
+    shape: tuple,
+    block_info: dict | None = None,
 ) -> np.ndarray:
     """Read the block of a ``map_blocks`` array that ``block_info`` locates."""
     location = block_info[None]["array-location"]
     shapes = tuple(stop - start for start, stop in location)
     starts = tuple(start for start, _ in location)
-    return _read_image_chunk(img_full_path, shapes, starts, dtype)
+    return _read_image_chunk(
+        img_full_path, shapes, starts, dtype, data_offset=data_offset, shape=shape
+    )
 
 
 def _get_chunk_list(chunks: dict, helpers: dict) -> tuple:
@@ -1657,7 +1671,12 @@ def _get_transpose_list(helpers: dict) -> tuple:
 
 
 def _read_image_chunk(
-    img_full_path, shapes: tuple, starts: tuple, dtype: str | None = None
+    img_full_path,
+    shapes: tuple,
+    starts: tuple,
+    dtype: str | None = None,
+    data_offset: int | None = None,
+    shape: tuple | None = None,
 ) -> np.ndarray:
     """
     Read a block of pixels from the primary HDU of a FITS file.
@@ -1672,6 +1691,13 @@ def _read_image_chunk(
         Index of the first pixel of the block on each axis.
     dtype : str, optional
         Declared dtype of the pixels (by default the file's).
+    data_offset : int, optional
+        Byte offset of the primary HDU's pixels in the file. Given with
+        ``shape`` and ``dtype``, the pixels are mapped directly from there
+        (they are unscaled, which the reader checks when it opens the file);
+        otherwise the file is opened with astropy.
+    shape : tuple of int, optional
+        Shape of the primary HDU's pixels, in FITS (reversed) axis order.
 
     Returns
     -------
@@ -1687,6 +1713,18 @@ def _read_image_chunk(
         slice(start, start + length)
         for start, length in zip(starts, shapes, strict=False)
     )
+    if data_offset is not None and shape is not None and dtype is not None:
+        # FITS pixels are big-endian
+        pixels = np.memmap(
+            img_full_path,
+            dtype=np.dtype(dtype).newbyteorder(">"),
+            mode="r",
+            offset=data_offset,
+            shape=tuple(shape),
+        )
+        return np.ascontiguousarray(
+            pixels[slices], dtype=np.dtype(dtype).newbyteorder("=")
+        )
     with fits.open(img_full_path, memmap=True) as hdulist:
         chunk = hdulist[0].data[slices]
         native = np.dtype(chunk.dtype if dtype is None else dtype).newbyteorder("=")
