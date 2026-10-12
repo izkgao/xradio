@@ -843,9 +843,10 @@ def _fits_header_to_xds_attrs(
             )
     primary = None
     ignored = []
-    for hdu in hdulist:
+    for index, hdu in enumerate(hdulist):
         if hdu.name == "PRIMARY":
             primary = hdu
+            primary_index = index
             # Memory map support check
             # avoid possibly non-existent hdu.scale_type attribute check and check header instead
             header = hdu.header
@@ -883,6 +884,10 @@ def _fits_header_to_xds_attrs(
         )
     helpers = {}
     attrs = {}
+    # where the pixels start in the file, so that the chunk reader can map them
+    # without opening the file as FITS and parsing its header again
+    fileinfo = hdulist.fileinfo(primary_index)
+    helpers["data_offset"] = None if fileinfo is None else fileinfo["datLoc"]
     naxes = header["NAXIS"]
     helpers["naxes"] = naxes
     dim_map = _create_dim_map(helpers, header)
@@ -1534,9 +1539,33 @@ def _add_sky_or_aperture(
 def _read_image_array(
     img_full_path: str, chunks: dict, helpers: dict, verbose: bool
 ) -> da.array:
-    # memmap = True allows only part of data to be loaded into memory
-    # may also need to pass mode='denywrite'
-    # https://stackoverflow.com/questions/35759713/astropy-io-fits-read-row-from-large-fits-file-with-mutliple-hdus
+    """
+    Return the pixels of a FITS image as a lazily read dask array.
+
+    The array is one ``map_blocks`` layer: each block is read by
+    :func:`_read_image_chunk` from the block's own location, mapping the
+    pixels from where the header ends rather than opening the file as FITS
+    again. Building it costs the same for any number of blocks, and its graph
+    has one task per block, so cubes read in many small blocks (one plane per
+    block, for example) build and compute quickly.
+
+    Parameters
+    ----------
+    img_full_path : str
+        Path to the FITS file.
+    chunks : dict
+        Dask chunk lengths by dimension, see :func:`_get_chunk_list`.
+    helpers : dict
+        Header information from :func:`_fits_header_to_xds_attrs`.
+    verbose : bool
+        Unused.
+
+    Returns
+    -------
+    dask.array.Array
+        The pixels with dimensions (time, frequency, polarization, l, m) (or
+        u, v), the axes the FITS file does not have added with length one.
+    """
     if isinstance(chunks, dict):
         mychunks = _get_chunk_list(chunks, helpers)
     else:
@@ -1545,48 +1574,37 @@ def _read_image_array(
         )
     transpose_list, new_axes = _get_transpose_list(helpers)
     data_type = helpers["dtype"]
-    rshape = helpers["shape"][::-1]
-    full_chunks = mychunks + tuple([1 for rr in range(5) if rr >= len(mychunks)])
-    d0slices = []
-    blc = tuple(5 * [0])
-    trc = tuple(rshape) + tuple([1 for rr in range(5) if rr >= len(mychunks)])
-    for d0 in range(blc[0], trc[0], full_chunks[0]):
-        d0len = min(full_chunks[0], trc[0] - d0)
-        d1slices = []
-        for d1 in range(blc[1], trc[1], full_chunks[1]):
-            d1len = min(full_chunks[1], trc[1] - d1)
-            d2slices = []
-            for d2 in range(blc[2], trc[2], full_chunks[2]):
-                d2len = min(full_chunks[2], trc[2] - d2)
-                d3slices = []
-                for d3 in range(blc[3], trc[3], full_chunks[3]):
-                    d3len = min(full_chunks[3], trc[3] - d3)
-                    d4slices = []
-                    for d4 in range(blc[4], trc[4], full_chunks[4]):
-                        d4len = min(full_chunks[4], trc[4] - d4)
-                        shapes = tuple(
-                            [d0len, d1len, d2len, d3len, d4len][: len(rshape)]
-                        )
-                        starts = tuple([d0, d1, d2, d3, d4][: len(rshape)])
-                        delayed_array = dask.delayed(_read_image_chunk)(
-                            img_full_path, shapes, starts, data_type
-                        )
-                        d4slices += [da.from_delayed(delayed_array, shapes, data_type)]
-                    d3slices += (
-                        [da.concatenate(d4slices, axis=4)]
-                        if len(rshape) > 4
-                        else d4slices
-                    )
-                d2slices += (
-                    [da.concatenate(d3slices, axis=3)] if len(rshape) > 3 else d3slices
-                )
-            d1slices += (
-                [da.concatenate(d2slices, axis=2)] if len(rshape) > 2 else d2slices
-            )
-        d0slices += [da.concatenate(d1slices, axis=1)] if len(rshape) > 1 else d1slices
-    ary = da.concatenate(d0slices, axis=0)
+    # FITS axes in numpy (reversed) order, as the file stores them
+    rshape = tuple(helpers["shape"][::-1])
+    block_chunks = da.core.normalize_chunks(mychunks, rshape)
+    ary = da.map_blocks(
+        _read_image_block,
+        img_full_path,
+        data_type,
+        helpers.get("data_offset"),
+        rshape,
+        chunks=block_chunks,
+        dtype=data_type,
+        meta=np.empty((0,) * len(rshape), dtype=data_type),
+    )
     ary = da.expand_dims(ary, new_axes)
     return ary.transpose(transpose_list)
+
+
+def _read_image_block(
+    img_full_path: str,
+    dtype: str,
+    data_offset: int | None,
+    shape: tuple,
+    block_info: dict | None = None,
+) -> np.ndarray:
+    """Read the block of a ``map_blocks`` array that ``block_info`` locates."""
+    location = block_info[None]["array-location"]
+    shapes = tuple(stop - start for start, stop in location)
+    starts = tuple(start for start, _ in location)
+    return _read_image_chunk(
+        img_full_path, shapes, starts, dtype, data_offset=data_offset, shape=shape
+    )
 
 
 def _get_chunk_list(chunks: dict, helpers: dict) -> tuple:
@@ -1653,7 +1671,12 @@ def _get_transpose_list(helpers: dict) -> tuple:
 
 
 def _read_image_chunk(
-    img_full_path, shapes: tuple, starts: tuple, dtype: str | None = None
+    img_full_path,
+    shapes: tuple,
+    starts: tuple,
+    dtype: str | None = None,
+    data_offset: int | None = None,
+    shape: tuple | None = None,
 ) -> np.ndarray:
     """
     Read a block of pixels from the primary HDU of a FITS file.
@@ -1668,6 +1691,13 @@ def _read_image_chunk(
         Index of the first pixel of the block on each axis.
     dtype : str, optional
         Declared dtype of the pixels (by default the file's).
+    data_offset : int, optional
+        Byte offset of the primary HDU's pixels in the file. Given with
+        ``shape`` and ``dtype``, the pixels are mapped directly from there
+        (they are unscaled, which the reader checks when it opens the file);
+        otherwise the file is opened with astropy.
+    shape : tuple of int, optional
+        Shape of the primary HDU's pixels, in FITS (reversed) axis order.
 
     Returns
     -------
@@ -1683,6 +1713,18 @@ def _read_image_chunk(
         slice(start, start + length)
         for start, length in zip(starts, shapes, strict=False)
     )
+    if data_offset is not None and shape is not None and dtype is not None:
+        # FITS pixels are big-endian
+        pixels = np.memmap(
+            img_full_path,
+            dtype=np.dtype(dtype).newbyteorder(">"),
+            mode="r",
+            offset=data_offset,
+            shape=tuple(shape),
+        )
+        return np.ascontiguousarray(
+            pixels[slices], dtype=np.dtype(dtype).newbyteorder("=")
+        )
     with fits.open(img_full_path, memmap=True) as hdulist:
         chunk = hdulist[0].data[slices]
         native = np.dtype(chunk.dtype if dtype is None else dtype).newbyteorder("=")
